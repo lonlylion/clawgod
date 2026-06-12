@@ -899,6 +899,20 @@ if (!process.env.CLAUDE_INTERNAL_FC_OVERRIDES && existsSync(featuresFile)) {
   } catch {}
 }
 
+// Monkey-patch process.execPath: Anthropic's CLI uses process.execPath to
+// locate the native binary for shell wrappers (find→bfs, grep→ugrep, rg) and
+// subprocess spawning. Under Bun, process.execPath returns the Bun runtime
+// path, not the Claude native binary. The launcher script sets
+// CLAUDE_CODE_EXECPATH to claude.orig (the real ELF binary) before exec'ing
+// Bun, so we use that as the source of truth.  See issue #100.
+const _realExecPath = process.env.CLAUDE_CODE_EXECPATH || process.execPath;
+if (_realExecPath !== process.execPath) {
+  Object.defineProperty(process, 'execPath', {
+    value: _realExecPath,
+    configurable: true,
+  });
+}
+
 require('./cli.original.cjs');
 WRAPPER_EOF
 chmod +x "$CLAWGOD_DIR/cli.cjs"
@@ -1387,6 +1401,18 @@ info "Bun loads cli.original.cjs"
 
 # ─── Replace claude command ───────────────────────────
 
+# Detect where claude is actually installed (supports native, npm, pnpm, yarn).
+# `command -v` is a POSIX builtin (works even on minimal images that no
+# longer ship `which`); `|| true` keeps a clean miss from tripping
+# `set -e` via the assignment's exit status under bash 5+.
+CLAUDE_BIN=$(command -v claude 2>/dev/null || true)
+if [ -z "$CLAUDE_BIN" ]; then
+  # No claude in PATH — use default location
+  CLAUDE_BIN="$BIN_DIR/claude"
+  dim "No existing claude found, installing to $BIN_DIR"
+fi
+CLAUDE_DIR=$(dirname "$CLAUDE_BIN")
+
 LAUNCHER_CONTENT="#!/bin/bash
 # clawgod launcher
 CLAWGOD_CLI=\"$CLAWGOD_DIR/cli.cjs\"
@@ -1405,19 +1431,9 @@ if [ ! -x \"\$BUN_BIN\" ]; then
   echo \"clawgod: install bun  curl -fsSL https://bun.sh/install | bash\" >&2
   exit 127
 fi
+export CLAUDE_CODE_EXECPATH=\"$CLAUDE_BIN.orig\"
 exec \"\$BUN_BIN\" \"\$CLAWGOD_CLI\" \"\$@\""
 
-# Detect where claude is actually installed (supports native, npm, pnpm, yarn).
-# `command -v` is a POSIX builtin (works even on minimal images that no
-# longer ship `which`); `|| true` keeps a clean miss from tripping
-# `set -e` via the assignment's exit status under bash 5+.
-CLAUDE_BIN=$(command -v claude 2>/dev/null || true)
-if [ -z "$CLAUDE_BIN" ]; then
-  # No claude in PATH — use default location
-  CLAUDE_BIN="$BIN_DIR/claude"
-  dim "No existing claude found, installing to $BIN_DIR"
-fi
-CLAUDE_DIR=$(dirname "$CLAUDE_BIN")
 
 # Back up original claude (only once)
 if [ ! -e "$CLAUDE_BIN.orig" ]; then

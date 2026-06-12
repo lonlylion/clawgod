@@ -1008,6 +1008,20 @@ if (!process.env.CLAUDE_INTERNAL_FC_OVERRIDES && existsSync(featuresFile)) {
   } catch {}
 }
 
+// Monkey-patch process.execPath: Anthropic's CLI uses process.execPath to
+// locate the native binary for shell wrappers (find→bfs, grep→ugrep, rg) and
+// subprocess spawning. Under Bun, process.execPath returns the Bun runtime
+// path, not the Claude native binary. The launcher script sets
+// CLAUDE_CODE_EXECPATH to claude.orig (the real binary) before exec'ing
+// Bun, so we use that as the source of truth.  See issue #100.
+const _realExecPath = process.env.CLAUDE_CODE_EXECPATH || process.execPath;
+if (_realExecPath !== process.execPath) {
+  Object.defineProperty(process, 'execPath', {
+    value: _realExecPath,
+    configurable: true,
+  });
+}
+
 require('./cli.original.cjs');
 '@ | Set-Content (Join-Path $ClawDir "cli.cjs") -Encoding UTF8
 Write-OK "Wrapper created (cli.cjs)"
@@ -1441,7 +1455,7 @@ if ($normalizedBunBin.Equals($normalizedUserProfile, [StringComparison]::Ordinal
     # absolute path since %USERPROFILE%-relative expansion doesn't apply.
     $bunPathInCmd = $BunBin
 }
-$launcherContent = "@echo off`r`nif not exist `"$cliPathInCmd`" (`r`n  echo clawgod: cli.cjs not found. Reinstall: irm https://github.com/0Chencc/clawgod/releases/latest/download/install.ps1 ^| iex`r`n  exit /b 127`r`n)`r`nif not exist `"$bunPathInCmd`" (`r`n  echo clawgod: bun not found at $bunPathInCmd. Install: https://bun.sh/install`r`n  exit /b 127`r`n)`r`n`"$bunPathInCmd`" `"$cliPathInCmd`" %*"
+$launcherContent = "@echo off`r`nif not exist `"$cliPathInCmd`" (`r`n  echo clawgod: cli.cjs not found. Reinstall: irm https://github.com/0Chencc/clawgod/releases/latest/download/install.ps1 ^| iex`r`n  exit /b 127`r`n)`r`nif not exist `"$bunPathInCmd`" (`r`n  echo clawgod: bun not found at $bunPathInCmd. Install: https://bun.sh/install`r`n  exit /b 127`r`n)`r`nset `"CLAUDE_CODE_EXECPATH=%~dp0claude.orig.exe`"`r`n`"$bunPathInCmd`" `"$cliPathInCmd`" %*"
 
 # Find and back up original claude
 $claudeCmd = Join-Path $BinDir "claude.cmd"
