@@ -239,7 +239,7 @@ $platformSuffix = "win32-$arch"
 #    already a hard prerequisite for the patcher, so reuse it.
 if (-not $NativeBin) {
     $npmPkg = "@anthropic-ai/claude-code-$platformSuffix"
-    Write-Dim "Fetching $npmPkg@latest from npm registry ..."
+    Write-Dim "Fetching $npmPkg@$Version from npm registry ..."
     $NativeBinTmpDir = Join-Path $env:TEMP "clawgod-binary-$([Guid]::NewGuid().ToString('N'))"
     New-Item -ItemType Directory -Force -Path $NativeBinTmpDir | Out-Null
     $fetchScript = Join-Path $NativeBinTmpDir "fetch.mjs"
@@ -258,7 +258,7 @@ if (-not $NativeBin) {
     if ($useNpmFetch) {
         Push-Location $NativeBinTmpDir
         try {
-            $npmOut = npm pack "$npmPkg@latest" --silent 2>&1
+            $npmOut = npm pack "$npmPkg@$Version" --silent 2>&1
             $tarball = Get-ChildItem $NativeBinTmpDir -Filter "*.tgz" | Select-Object -First 1
             if ($tarball) {
                 tar xzf $tarball.FullName 2>$null
@@ -346,7 +346,7 @@ console.log(`Extracted ${files} files`);
 console.log(`VERSION=${meta.version}`);
 '@ | Set-Content $fetchScript -Encoding UTF8
 
-        $output = & node $fetchScript "$npmPkg@latest" $NativeBinTmpDir 2>&1
+        $output = & node $fetchScript "$npmPkg@$Version" $NativeBinTmpDir 2>&1
         $exitCode = $LASTEXITCODE
         $output | ForEach-Object { Write-Host "  $_" }
         Remove-Item -Force $fetchScript -ErrorAction SilentlyContinue
@@ -387,416 +387,358 @@ $extractorPath = Join-Path $ClawDir "extract-natives.mjs"
 @'
 #!/usr/bin/env node
 /**
- * ClawGod native module extractor
+ * ClawGod Bun section extractor
  *
- * Extracts embedded .node NAPI modules from a Bun single-file executable
- * (the official Claude Code native binary).
+ * Parses the .bun (PE/ELF) or __BUN,__bun (Mach-O) section embedded in a
+ * Bun standalone executable, walks the module graph, and extracts:
+ *   - the entry-point module      → <out>/cli.original.js
+ *   - every loader=napi module    → <out>/vendor/<name>/<arch>-<os>/<name>.node
  *
- * Supports:
- *   - Mach-O (macOS) — arm64 + x86_64 thin binaries
- *   - ELF (Linux)    — arm64 + x86_64
- *   - PE (Windows)   — x86_64 + arm64
+ * Everything else is dropped (e.g. auto-generated *.js napi shims aren't
+ * needed because cli.js already inlines the require('/$bunfs/root/X.node')
+ * calls that post-process.mjs rewrites to the vendor lookup).
+ *
+ * Adapted from /home/kaiju/code/python/parse-bun/main.js (which itself
+ * implements the format documented in docs/bun-section-format.md). Lazy
+ * Bun.file reads were replaced with readFileSync so the script runs under
+ * the existing `node` invocation in install.sh / install.ps1.
  *
  * Usage:
  *   node extract-natives.mjs <binary-path> <output-dir>
  */
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync } from 'fs';
-import { join, basename } from 'path';
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { join, basename } from 'node:path';
 
-// ─── Mach-O constants ────────────────────────────────────────────────
+// ─── Format constants ────────────────────────────────────────────────
 
-const MH_MAGIC_64 = 0xfeedfacf;           // little-endian 64-bit
-const LC_SEGMENT_64 = 0x19;
-const LC_ID_DYLIB = 0x0d;
-const MH_DYLIB = 6;
-const CPU_TYPE_X86_64 = 0x01000007;
-const CPU_TYPE_ARM64 = 0x0100000c;
+const TRAILER             = Buffer.from('\n---- Bun! ----\n');
+const BUN_SECTION_NAME    = '.bun';
+const OFFSET_STRUCT_SIZE  = 32;
+const MODULE_RECORD_SIZE  = 52;
 
-// ─── ELF constants ───────────────────────────────────────────────────
+// loader id → name (subset; only `napi` is acted on, rest informational)
+const LOADERS = {
+  0:'jsx', 1:'js', 2:'ts', 3:'tsx', 4:'css', 5:'file', 6:'json', 7:'jsonc',
+  8:'toml', 9:'wasm', 10:'napi', 11:'base64', 12:'dataurl', 13:'text',
+  14:'bunsh', 15:'sqlite', 16:'sqlite_embedded', 17:'html', 18:'yaml',
+  19:'json5', 20:'md',
+};
 
-const ELF_MAGIC = Buffer.from([0x7f, 0x45, 0x4c, 0x46]); // 7f 'E' 'L' 'F'
-const ET_DYN = 3;                          // shared object
-const EM_X86_64 = 62;
-const EM_AARCH64 = 183;
+// ELF
+const ELF_MAGIC_LE          = 0x464c457f; // "\x7fELF" LE u32
+const ELF_EI_CLASS          = 0x04;
+const ELF_EI_DATA           = 0x05;
+const ELF_CLASS_64          = 0x02;
+const ELF_DATA_LE           = 0x01;
+const ELF_E_MACHINE         = 0x12;       // u16
+const ELF_EHDR_SIZE         = 0x40;
+const ELF64_E_SHOFF         = 0x28;
+const ELF64_E_SHENTSIZE     = 0x3a;
+const ELF64_E_SHNUM         = 0x3c;
+const ELF64_E_SHSTRNDX      = 0x3e;
+const ELF64_SH_NAME         = 0x00;
+const ELF64_SH_OFFSET       = 0x18;
+const ELF64_SH_SIZE         = 0x20;
+const EM_X86_64             = 0x3e;
+const EM_AARCH64            = 0xb7;
 
-// ─── PE constants ────────────────────────────────────────────────────
+// Mach-O (thin LE 64-bit; fat / 32-bit / BE rejected with clear message)
+const MH_MAGIC_64           = 0xfeedfacf;
+const MH_CIGAM_64           = 0xcffaedfe;
+const MH_MAGIC              = 0xfeedface;
+const MH_CIGAM              = 0xcefaedfe;
+const MACH_CPUTYPE_OFF      = 0x04;        // u32
+const MACH_NCMDS_OFF        = 0x10;
+const MACH_SIZEOFCMDS_OFF   = 0x14;
+const MACH_HDR_SIZE_64      = 0x20;
+const LC_SEGMENT_64         = 0x19;
+const LC_CMDSIZE_OFF        = 0x04;
+const LC_SEGNAME_OFF        = 0x08;
+const LC_SEGNAME_LEN        = 0x10;
+const SEG64_NSECTS_OFF      = 0x40;
+const SEG64_SECTS_OFF       = 0x48;
+const SECT64_ENTRY_SIZE     = 0x50;
+const SECT64_SIZE_OFF       = 0x28;
+const SECT64_OFFSET_OFF     = 0x30;
+const CPU_TYPE_X86_64       = 0x01000007;
+const CPU_TYPE_ARM64        = 0x0100000c;
 
-const MZ_MAGIC = Buffer.from([0x4d, 0x5a]);   // "MZ"
-const PE_MAGIC = Buffer.from([0x50, 0x45, 0, 0]); // "PE\0\0"
-const IMAGE_FILE_MACHINE_AMD64 = 0x8664;
-const IMAGE_FILE_MACHINE_ARM64 = 0xaa64;
-const IMAGE_FILE_DLL = 0x2000;
+// PE
+const PE_OFFSET_PTR         = 0x3c;
+const PE_MACHINE_OFF        = 0x04;       // relative to PE sig
+const PE_NUM_SECTIONS_OFF   = 0x06;
+const PE_OPT_HDR_SIZE_OFF   = 0x14;
+const PE_COFF_HDR_SIZE      = 0x18;
+const PE_OPT_MAGIC_OFF      = 0x18;
+const PE_OPT_MAGIC_PE32P    = 0x20b;
+const PE_SECTION_ENTRY_SIZE = 0x28;
+const PE_SECT_RAW_SIZE_OFF  = 0x10;
+const PE_SECT_RAW_OFF_OFF   = 0x14;
+const PE_SECT_NAME_LEN      = 0x08;
+const IMAGE_MACHINE_AMD64   = 0x8664;
+const IMAGE_MACHINE_ARM64   = 0xaa64;
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
-function archName(format, cputype) {
-  if (format === 'macho') {
-    if (cputype === CPU_TYPE_ARM64) return 'arm64';
-    if (cputype === CPU_TYPE_X86_64) return 'x64';
-  }
-  if (format === 'elf') {
-    if (cputype === EM_AARCH64) return 'arm64';
-    if (cputype === EM_X86_64) return 'x64';
-  }
-  if (format === 'pe') {
-    if (cputype === IMAGE_FILE_MACHINE_ARM64) return 'arm64';
-    if (cputype === IMAGE_FILE_MACHINE_AMD64) return 'x64';
-  }
-  return null;
+function die(msg) { throw new Error(`error: ${msg}`); }
+
+function readU64LE(buf, off, what) {
+  const v = buf.readBigUInt64LE(off);
+  if (v > BigInt(Number.MAX_SAFE_INTEGER)) die(`${what} exceeds JS safe integer: ${v}`);
+  return Number(v);
 }
 
-function platformSuffix(format, arch) {
-  const os = format === 'macho' ? 'darwin' : format === 'elf' ? 'linux' : 'win32';
-  return `${arch}-${os}`;
+function checkedSlice(buf, off, size, what) {
+  if (off < 0 || size < 0 || off + size > buf.length) {
+    die(`${what} out of bounds: offset=${off} size=${size} buf=${buf.length}`);
+  }
+  return buf.subarray(off, off + size);
 }
 
-// ─── Mach-O parser ───────────────────────────────────────────────────
+function decodeName(buf) {
+  return buf.toString('utf8').replace(/\u0000+$/u, '');
+}
 
-function parseMachODylib(buf, off) {
-  const magic = buf.readUInt32LE(off);
-  if (magic !== MH_MAGIC_64) return null;
+// ─── Section locators (per format) ───────────────────────────────────
 
-  const cputype = buf.readUInt32LE(off + 4);
-  if (cputype !== CPU_TYPE_ARM64 && cputype !== CPU_TYPE_X86_64) return null;
+function findSectionElf(buf) {
+  if (buf.length < ELF_EHDR_SIZE) die('ELF too small');
+  if (buf[ELF_EI_CLASS] !== ELF_CLASS_64) die('ELF: only 64-bit supported');
+  if (buf[ELF_EI_DATA]  !== ELF_DATA_LE) die('ELF: only little-endian supported');
 
-  const filetype = buf.readUInt32LE(off + 12);
-  if (filetype !== MH_DYLIB) return null;
+  const eMachine = buf.readUInt16LE(ELF_E_MACHINE);
+  const arch = eMachine === EM_X86_64  ? 'x64'
+             : eMachine === EM_AARCH64 ? 'arm64'
+             : die(`ELF: unsupported e_machine 0x${eMachine.toString(16)}`);
 
-  const ncmds = buf.readUInt32LE(off + 16);
-  if (ncmds === 0 || ncmds > 500) return null;
+  const shoff     = readU64LE(buf, ELF64_E_SHOFF, 'ELF e_shoff');
+  const shentsize = buf.readUInt16LE(ELF64_E_SHENTSIZE);
+  const shnum     = buf.readUInt16LE(ELF64_E_SHNUM);
+  const shstrndx  = buf.readUInt16LE(ELF64_E_SHSTRNDX);
+  if (shstrndx >= shnum) die('ELF e_shstrndx out of range');
 
-  let totalFileEnd = 0;
-  let installName = null;
-  let cmdOff = off + 32;
+  const shstrEntry  = buf.subarray(shoff + shstrndx * shentsize, shoff + (shstrndx + 1) * shentsize);
+  const shstrOffset = readU64LE(shstrEntry, ELF64_SH_OFFSET, 'shstrtab offset');
+  const shstrSize   = readU64LE(shstrEntry, ELF64_SH_SIZE,   'shstrtab size');
+  const shstr       = checkedSlice(buf, shstrOffset, shstrSize, 'shstrtab');
 
+  let match = null;
+  for (let i = 0; i < shnum; i++) {
+    const entry   = buf.subarray(shoff + i * shentsize, shoff + (i + 1) * shentsize);
+    const nameIdx = entry.readUInt32LE(ELF64_SH_NAME);
+    if (nameIdx >= shstr.length) continue;
+    let nameEnd = nameIdx;
+    while (nameEnd < shstr.length && shstr[nameEnd] !== 0) nameEnd++;
+    if (shstr.toString('ascii', nameIdx, nameEnd) !== BUN_SECTION_NAME) continue;
+    if (match) die('ELF has multiple .bun sections');
+    const rawOffset = readU64LE(entry, ELF64_SH_OFFSET, '.bun sh_offset');
+    const rawSize   = readU64LE(entry, ELF64_SH_SIZE,   '.bun sh_size');
+    if (rawOffset + rawSize > buf.length) die('.bun out of file bounds');
+    match = { format: 'ELF', os: 'linux', arch, rawOffset, rawSize };
+  }
+  if (!match) die('ELF has no .bun section');
+  return match;
+}
+
+function findSectionMacho(buf) {
+  if (buf.length < MACH_HDR_SIZE_64) die('Mach-O too small');
+  const cputype = buf.readUInt32LE(MACH_CPUTYPE_OFF);
+  const arch = cputype === CPU_TYPE_X86_64 ? 'x64'
+             : cputype === CPU_TYPE_ARM64  ? 'arm64'
+             : die(`Mach-O: unsupported cputype 0x${cputype.toString(16)}`);
+
+  const ncmds      = buf.readUInt32LE(MACH_NCMDS_OFF);
+  const sizeofcmds = buf.readUInt32LE(MACH_SIZEOFCMDS_OFF);
+  if (sizeofcmds === 0 || MACH_HDR_SIZE_64 + sizeofcmds > buf.length) die('Mach-O sizeofcmds invalid');
+  const cmds = buf.subarray(MACH_HDR_SIZE_64, MACH_HDR_SIZE_64 + sizeofcmds);
+
+  let match = null;
+  let off = 0;
   for (let i = 0; i < ncmds; i++) {
-    if (cmdOff + 8 > buf.length) return null;
-
-    const cmd = buf.readUInt32LE(cmdOff);
-    const cmdsize = buf.readUInt32LE(cmdOff + 4);
-    if (cmdsize === 0 || cmdsize > 65536) return null;
-
+    if (off + 8 > sizeofcmds) die(`Mach-O LC ${i} truncated`);
+    const cmd     = cmds.readUInt32LE(off);
+    const cmdsize = cmds.readUInt32LE(off + LC_CMDSIZE_OFF);
+    if (cmdsize < 8 || off + cmdsize > sizeofcmds) die(`Mach-O LC ${i} cmdsize invalid: ${cmdsize}`);
     if (cmd === LC_SEGMENT_64) {
-      const fileoff = Number(buf.readBigUInt64LE(cmdOff + 40));
-      const filesize = Number(buf.readBigUInt64LE(cmdOff + 48));
-      const end = fileoff + filesize;
-      if (end > totalFileEnd) totalFileEnd = end;
-    } else if (cmd === LC_ID_DYLIB) {
-      // dylib_command: uint32 cmd, cmdsize, str_offset, timestamp, version...
-      // then name string at cmdOff + str_offset
-      const strOff = buf.readUInt32LE(cmdOff + 8);
-      const nameStart = cmdOff + strOff;
-      const nameEnd = buf.indexOf(0, nameStart);
-      if (nameEnd !== -1 && nameEnd - nameStart < 1024) {
-        installName = buf.slice(nameStart, nameEnd).toString('utf8');
+      const segname = cmds.toString('ascii', off + LC_SEGNAME_OFF, off + LC_SEGNAME_OFF + LC_SEGNAME_LEN).replace(/\0+$/, '');
+      if (segname === '__BUN') {
+        const nsects = cmds.readUInt32LE(off + SEG64_NSECTS_OFF);
+        if (SEG64_SECTS_OFF + nsects * SECT64_ENTRY_SIZE > cmdsize) die(`Mach-O LC_SEGMENT_64(__BUN) sections exceed cmdsize`);
+        for (let j = 0; j < nsects; j++) {
+          const s = off + SEG64_SECTS_OFF + j * SECT64_ENTRY_SIZE;
+          const sectname = cmds.toString('ascii', s, s + LC_SEGNAME_LEN).replace(/\0+$/, '');
+          if (sectname === '__bun') {
+            const rawSize   = readU64LE(cmds, s + SECT64_SIZE_OFF, '__bun size');
+            const rawOffset = cmds.readUInt32LE(s + SECT64_OFFSET_OFF);
+            if (rawOffset + rawSize > buf.length) die('__bun out of file bounds');
+            if (match) die('Mach-O has multiple __BUN,__bun sections');
+            match = { format: 'Mach-O', os: 'darwin', arch, rawOffset, rawSize };
+          }
+        }
       }
     }
-
-    cmdOff += cmdsize;
+    off += cmdsize;
   }
+  if (!match) die('Mach-O has no __BUN,__bun section');
+  return match;
+}
 
-  if (totalFileEnd === 0) return null;
+function findSectionPe(buf) {
+  if (buf.length < 0x40) die('PE too small');
+  if (buf.toString('ascii', 0, 2) !== 'MZ') die('PE missing MZ header');
+  const peOff = buf.readUInt32LE(PE_OFFSET_PTR);
+  if (buf.toString('ascii', peOff, peOff + 4) !== 'PE\0\0') die('PE missing PE signature');
 
+  const machine = buf.readUInt16LE(peOff + PE_MACHINE_OFF);
+  const arch = machine === IMAGE_MACHINE_AMD64 ? 'x64'
+             : machine === IMAGE_MACHINE_ARM64 ? 'arm64'
+             : die(`PE: unsupported machine 0x${machine.toString(16)}`);
+
+  const optMagic = buf.readUInt16LE(peOff + PE_OPT_MAGIC_OFF);
+  if (optMagic !== PE_OPT_MAGIC_PE32P) die(`PE: only 64-bit (PE32+) supported, got 0x${optMagic.toString(16)}`);
+
+  const numSect    = buf.readUInt16LE(peOff + PE_NUM_SECTIONS_OFF);
+  const optHdrSize = buf.readUInt16LE(peOff + PE_OPT_HDR_SIZE_OFF);
+  const sectTable  = peOff + PE_COFF_HDR_SIZE + optHdrSize;
+
+  let match = null;
+  for (let i = 0; i < numSect; i++) {
+    const entry  = sectTable + i * PE_SECTION_ENTRY_SIZE;
+    const rawNm  = buf.subarray(entry, entry + PE_SECT_NAME_LEN);
+    const nul    = rawNm.indexOf(0);
+    const name   = rawNm.subarray(0, nul === -1 ? rawNm.length : nul).toString('ascii');
+    if (name !== BUN_SECTION_NAME) continue;
+    if (match) die('PE has multiple .bun sections');
+    const rawSize   = buf.readUInt32LE(entry + PE_SECT_RAW_SIZE_OFF);
+    const rawOffset = buf.readUInt32LE(entry + PE_SECT_RAW_OFF_OFF);
+    if (rawOffset + rawSize > buf.length) die('.bun out of file bounds');
+    match = { format: 'PE', os: 'win32', arch, rawOffset, rawSize };
+  }
+  if (!match) die('PE has no .bun section');
+  return match;
+}
+
+function findBunSection(buf) {
+  if (buf.length < 4) die('file too small');
+  const magic = buf.readUInt32LE(0);
+  if (magic === ELF_MAGIC_LE)                       return findSectionElf(buf);
+  if (magic === MH_MAGIC_64)                        return findSectionMacho(buf);
+  if (magic === MH_CIGAM_64 || magic === MH_CIGAM)  die('Mach-O: only little-endian supported');
+  if (magic === MH_MAGIC)                           die('Mach-O: only 64-bit supported');
+  return findSectionPe(buf);
+}
+
+// ─── Payload + module records ────────────────────────────────────────
+
+function parsePayload(sectionData) {
+  if (sectionData.length < 8) die('.bun too small for length prefix');
+  const payloadSize = readU64LE(sectionData, 0, '.bun payload length');
+  if (payloadSize + 8 > sectionData.length) die('.bun payload exceeds raw section');
+  const payload = sectionData.subarray(8, 8 + payloadSize);
+  if (payload.length < OFFSET_STRUCT_SIZE + TRAILER.length) die('.bun payload too small');
+  if (!payload.subarray(payload.length - TRAILER.length).equals(TRAILER)) die('.bun trailer mismatch');
+  return payload;
+}
+
+function parseOffsets(payload) {
+  const start = payload.length - TRAILER.length - OFFSET_STRUCT_SIZE;
   return {
-    offset: off,
-    size: totalFileEnd,
-    arch: archName('macho', cputype),
-    installName,
+    modules_offset: payload.readUInt32LE(start + 8),
+    modules_size:   payload.readUInt32LE(start + 12),
+    entry_point_id: payload.readUInt32LE(start + 16),
   };
 }
 
-function extractMachODylibs(buf) {
-  const dylibs = [];
-  // Magic bytes for fast indexOf scan: cf fa ed fe (MH_MAGIC_64 LE)
-  const magicBytes = Buffer.from([0xcf, 0xfa, 0xed, 0xfe]);
-
-  let off = 1;  // skip the main binary at offset 0
-  while ((off = buf.indexOf(magicBytes, off)) !== -1) {
-    const info = parseMachODylib(buf, off);
-    if (info && off + info.size <= buf.length) {
-      dylibs.push(info);
-      off += info.size;  // skip past this dylib
-    } else {
-      off += 4;
-    }
+function parseModules(payload, offsets) {
+  if (offsets.modules_size % MODULE_RECORD_SIZE !== 0) {
+    die(`modules table size not a multiple of ${MODULE_RECORD_SIZE}: ${offsets.modules_size}`);
   }
-
-  return dylibs;
+  const count = offsets.modules_size / MODULE_RECORD_SIZE;
+  if (offsets.entry_point_id >= count) die(`entry_point_id ${offsets.entry_point_id} >= ${count}`);
+  const table = checkedSlice(payload, offsets.modules_offset, offsets.modules_size, 'modules table');
+  const out = [];
+  for (let i = 0; i < count; i++) {
+    const rec        = table.subarray(i * MODULE_RECORD_SIZE, (i + 1) * MODULE_RECORD_SIZE);
+    const nameOff    = rec.readUInt32LE(0);
+    const nameSize   = rec.readUInt32LE(4);
+    const contentOff = rec.readUInt32LE(8);
+    const contentSize= rec.readUInt32LE(12);
+    const loaderId   = rec.readUInt8(49);
+    const name = decodeName(checkedSlice(payload, nameOff, nameSize, `module[${i}].name`));
+    const content = checkedSlice(payload, contentOff, contentSize, `module[${i}].content`);
+    out.push({
+      index: i,
+      entry: i === offsets.entry_point_id,
+      name,
+      content,
+      loader: LOADERS[loaderId] ?? `unknown(${loaderId})`,
+    });
+  }
+  return out;
 }
 
-// ─── ELF parser ──────────────────────────────────────────────────────
+// ─── Output dispatch ─────────────────────────────────────────────────
 
-function parseELFSharedObject(buf, off) {
-  if (buf.length - off < 64) return null;
-  if (!buf.slice(off, off + 4).equals(ELF_MAGIC)) return null;
-
-  const eiClass = buf.readUInt8(off + 4);        // 1=32-bit, 2=64-bit
-  if (eiClass !== 2) return null;
-
-  const eiData = buf.readUInt8(off + 5);         // 1=LE, 2=BE
-  if (eiData !== 1) return null;                 // only LE supported
-
-  const eType = buf.readUInt16LE(off + 16);
-  if (eType !== ET_DYN) return null;
-
-  const eMachine = buf.readUInt16LE(off + 18);
-  if (eMachine !== EM_X86_64 && eMachine !== EM_AARCH64) return null;
-
-  // ELF64 header layout:
-  //   e_shoff (section header offset): off + 40 (u64)
-  //   e_shentsize: off + 58 (u16)
-  //   e_shnum:     off + 60 (u16)
-  const shoff = Number(buf.readBigUInt64LE(off + 40));
-  const shentsize = buf.readUInt16LE(off + 58);
-  const shnum = buf.readUInt16LE(off + 60);
-
-  if (shentsize !== 64 || shnum === 0 || shnum > 1000) return null;
-
-  // Total size = shoff + shnum * shentsize (the section header table is at the end)
-  const totalSize = shoff + shnum * shentsize;
-  if (totalSize > buf.length - off) return null;
-
-  return {
-    offset: off,
-    size: totalSize,
-    arch: archName('elf', eMachine),
-    installName: null,  // ELF soname requires dynamic section walk; we'll rely on adjacent strings
-  };
+function napiBasename(name) {
+  // Bun records may use either '/' (POSIX builds) or '\\' (PE) as separator;
+  // always normalize so basename grabs the right tail.
+  const flat = name.replaceAll('\\', '/');
+  const tail = flat.split('/').pop() ?? '';
+  return tail.replace(/\.node$/i, '');
 }
 
-function extractELFSharedObjects(buf) {
-  const sos = [];
-
-  // Scan for ELF magic; ELF headers are rare in data so 4-byte alignment is fine
-  for (let off = 4; off < buf.length - 64; off += 4) {
-    if (buf.readUInt8(off) !== 0x7f) continue;
-    const info = parseELFSharedObject(buf, off);
-    if (!info) continue;
-    if (off + info.size > buf.length) continue;
-    sos.push(info);
-  }
-
-  return sos;
-}
-
-// ─── PE parser ───────────────────────────────────────────────────────
-
-function parsePEDll(buf, off) {
-  if (buf.length - off < 1024) return null;
-  if (!buf.slice(off, off + 2).equals(MZ_MAGIC)) return null;
-
-  // PE header offset at MZ + 0x3c (e_lfanew)
-  const peOff = buf.readUInt32LE(off + 0x3c);
-  if (peOff > 4096) return null;                 // sanity
-
-  if (off + peOff + 24 > buf.length) return null;
-  if (!buf.slice(off + peOff, off + peOff + 4).equals(PE_MAGIC)) return null;
-
-  const machine = buf.readUInt16LE(off + peOff + 4);
-  if (machine !== IMAGE_FILE_MACHINE_AMD64 && machine !== IMAGE_FILE_MACHINE_ARM64) return null;
-
-  const numberOfSections = buf.readUInt16LE(off + peOff + 6);
-  const sizeOfOptionalHeader = buf.readUInt16LE(off + peOff + 20);
-  const characteristics = buf.readUInt16LE(off + peOff + 22);
-  if (!(characteristics & IMAGE_FILE_DLL)) return null;
-
-  // Walk sections to find the max (PointerToRawData + SizeOfRawData)
-  const sectionHeaderOff = off + peOff + 24 + sizeOfOptionalHeader;
-  let totalSize = sectionHeaderOff - off;  // header area minimum
-
-  for (let i = 0; i < numberOfSections; i++) {
-    const secOff = sectionHeaderOff + i * 40;
-    if (secOff + 40 > buf.length) return null;
-    const sizeOfRawData = buf.readUInt32LE(secOff + 16);
-    const pointerToRawData = buf.readUInt32LE(secOff + 20);
-    const end = pointerToRawData + sizeOfRawData;
-    if (end > totalSize) totalSize = end;
-  }
-
-  if (totalSize === 0 || totalSize > 50 * 1024 * 1024) return null;
-
-  return {
-    offset: off,
-    size: totalSize,
-    arch: archName('pe', machine),
-    installName: null,
-  };
-}
-
-function extractPEDlls(buf) {
-  const dlls = [];
-
-  for (let off = 0; off < buf.length - 1024; off++) {
-    if (buf.readUInt8(off) !== 0x4d) continue;
-    if (buf.readUInt8(off + 1) !== 0x5a) continue;
-    const info = parsePEDll(buf, off);
-    if (!info) continue;
-    if (off + info.size > buf.length) continue;
-    dlls.push(info);
-  }
-
-  return dlls;
-}
-
-// ─── Main dispatch ───────────────────────────────────────────────────
-
-function detectFormat(buf) {
-  if (buf.readUInt32LE(0) === MH_MAGIC_64) return 'macho';
-  if (buf.slice(0, 4).equals(ELF_MAGIC)) return 'elf';
-  if (buf.slice(0, 2).equals(MZ_MAGIC)) return 'pe';
-  return null;
-}
-
-// Names to look for from install names / nearby strings
-const KNOWN_MODULES = [
-  'image-processor',
-  'audio-capture',
-  'computer-use-input',
-  'computer-use-swift',
-  'url-handler',
-];
-
-function identifyDylib(buf, dylib) {
-  // 1. Try install name (most reliable)
-  if (dylib.installName) {
-    const base = basename(dylib.installName).replace(/\.(node|dylib|so|dll)$/, '');
-    for (const m of KNOWN_MODULES) {
-      if (base === m) return m;
-      // Handle variants like "libcomputer_use_input.dylib"
-      if (base === `lib${m.replace(/-/g, '_')}`) return m;
-      if (base === `lib${m.replace(/-/g, '')}`) return m;
-      if (base.toLowerCase().includes(m.replace(/-/g, ''))) return m;
-    }
-  }
-
-  // 2. Scan the dylib body for known module name strings
-  const body = buf.slice(dylib.offset, dylib.offset + dylib.size);
-  for (const m of KNOWN_MODULES) {
-    if (body.indexOf(Buffer.from(m)) !== -1) return m;
-  }
-
-  return null;
-}
-
-// ─── cli.js text extraction (Bun standalone) ─────────────────────────
-// Two anchors: bunfs path (primary, Mach-O/ELF) and cli_after_main_complete
-// (fallback, used when Windows PE builds omit the bunfs path string).
-
-const CLI_PATH_MARKER = Buffer.from('file:///$bunfs/root/src/entrypoints/cli.js');
-const CLI_FN_MARKER = Buffer.from('(function(exports, require, module');
-const CLI_TAIL_MARKER = Buffer.from('cli_after_main_complete")}');
-const CLI_END_MARKER = Buffer.from(');})');
-
-function extractCliJs(buf) {
-  let fnStart = -1;
-  const pathOff = buf.indexOf(CLI_PATH_MARKER);
-  if (pathOff !== -1) {
-    const candidate = buf.indexOf(CLI_FN_MARKER, pathOff);
-    if (candidate !== -1 && candidate - pathOff <= 1024) fnStart = candidate;
-  }
-
-  if (fnStart === -1) {
-    const tailMark = buf.indexOf(CLI_TAIL_MARKER);
-    if (tailMark === -1) return null;
-    const candidate = buf.lastIndexOf(CLI_FN_MARKER, tailMark);
-    if (candidate === -1 || tailMark - candidate < 1024 * 1024) return null;
-    fnStart = candidate;
-  }
-
-  const tailFromFn = buf.indexOf(CLI_TAIL_MARKER, fnStart);
-  if (tailFromFn === -1) return null;
-  const ending = buf.indexOf(CLI_END_MARKER, tailFromFn);
-  if (ending === -1 || ending - tailFromFn > 4096) return null;
-  return buf.slice(fnStart, ending + CLI_END_MARKER.length).toString('utf8');
-}
+// ─── Main ────────────────────────────────────────────────────────────
 
 function main() {
-  const [, , binaryPath, outputDir, ...rest] = process.argv;
-  const wantCliJs = rest.includes('--cli-js');
-
+  const [,, binaryPath, outputDir] = process.argv;
   if (!binaryPath || !outputDir) {
-    console.error('Usage: extract-natives.mjs <binary-path> <output-dir> [--cli-js]');
+    console.error('Usage: extract-natives.mjs <binary-path> <output-dir>');
     process.exit(1);
   }
-
   if (!existsSync(binaryPath)) {
     console.error(`Binary not found: ${binaryPath}`);
     process.exit(1);
   }
 
-  const stat = statSync(binaryPath);
-  if (stat.size < 10 * 1024 * 1024) {
-    console.error(`Binary too small (${stat.size} bytes) — not a native Claude Code binary`);
-    process.exit(1);
-  }
-
   const buf = readFileSync(binaryPath);
-  const format = detectFormat(buf);
-
-  if (!format) {
-    console.error('Unknown binary format (expected Mach-O / ELF / PE)');
-    process.exit(1);
-  }
-
-  console.log(`Format:  ${format}`);
   console.log(`Size:    ${(buf.length / 1024 / 1024).toFixed(1)} MB`);
 
-  if (wantCliJs) {
-    const js = extractCliJs(buf);
-    if (!js) {
-      console.error('Could not locate cli.js payload in binary (markers missing).');
-      process.exit(2);
-    }
-    mkdirSync(outputDir, { recursive: true });
-    const out = join(outputDir, 'cli.original.js');
-    writeFileSync(out, js);
-    console.log(`  cli.js  ${(js.length / 1024 / 1024).toFixed(2)} MB -> ${out}`);
-    return;
-  }
+  const section = findBunSection(buf);
+  console.log(`Format:  ${section.format} (${section.arch}-${section.os})`);
 
-  let libs = [];
-  if (format === 'macho') libs = extractMachODylibs(buf);
-  else if (format === 'elf') libs = extractELFSharedObjects(buf);
-  else if (format === 'pe') libs = extractPEDlls(buf);
-
-  // Skip the first (main binary itself)
-  libs = libs.filter(l => l.offset !== 0);
-
-  console.log(`Found:   ${libs.length} embedded native libraries`);
-  console.log();
+  const sectionData = checkedSlice(buf, section.rawOffset, section.rawSize, '.bun section');
+  const payload     = parsePayload(sectionData);
+  const offsets     = parseOffsets(payload);
+  const modules     = parseModules(payload, offsets);
+  console.log(`Modules: ${modules.length} (entry id=${offsets.entry_point_id})`);
 
   mkdirSync(outputDir, { recursive: true });
 
-  const summary = { extracted: [], skipped: [] };
-
-  for (const lib of libs) {
-    const name = identifyDylib(buf, lib);
-    if (!name) {
-      summary.skipped.push({ ...lib, reason: 'unidentified' });
-      continue;
+  let cliCount = 0, napiCount = 0, dropped = 0;
+  for (const m of modules) {
+    if (m.entry) {
+      const out = join(outputDir, 'cli.original.js');
+      writeFileSync(out, m.content);
+      console.log(`  cli.js   ${(m.content.length / 1024 / 1024).toFixed(2)} MB → ${out} (${m.name})`);
+      cliCount++;
+    } else if (m.loader === 'napi') {
+      const base = napiBasename(m.name);
+      if (!base) { console.warn(`  skip napi ${m.name}: empty basename`); dropped++; continue; }
+      const dir = join(outputDir, 'vendor', base, `${section.arch}-${section.os}`);
+      mkdirSync(dir, { recursive: true });
+      const out = join(dir, `${base}.node`);
+      writeFileSync(out, m.content);
+      console.log(`  napi     ${(m.content.length / 1024).toFixed(0).padStart(5)} KB → ${out}`);
+      napiCount++;
+    } else {
+      dropped++;
     }
-
-    const platform = platformSuffix(format, lib.arch);
-    const targetDir = join(outputDir, name, platform);
-    mkdirSync(targetDir, { recursive: true });
-    const targetFile = join(targetDir, `${name}.node`);
-
-    const data = buf.slice(lib.offset, lib.offset + lib.size);
-    writeFileSync(targetFile, data);
-
-    console.log(`  ✓ ${name.padEnd(20)} ${lib.arch.padEnd(6)} ${(lib.size / 1024).toFixed(0).padStart(5)} KB → ${targetFile}`);
-    summary.extracted.push({ name, platform, size: lib.size });
   }
-
-  console.log();
-  console.log(`Extracted ${summary.extracted.length}, skipped ${summary.skipped.length}`);
-
-  if (summary.skipped.length > 0) {
-    console.log('\nSkipped (unidentified):');
-    for (const s of summary.skipped) {
-      console.log(`  offset=${s.offset} arch=${s.arch} size=${(s.size / 1024).toFixed(0)}KB`);
-    }
+  console.log(`Extracted: ${cliCount} cli.js + ${napiCount} napi (${dropped} dropped)`);
+  if (cliCount !== 1) {
+    console.error(`error: expected exactly 1 entry-point, got ${cliCount}`);
+    process.exit(2);
   }
 }
 
@@ -805,21 +747,20 @@ main();
 
 # ─── Extract cli.js + native modules from Bun binary ──────────
 
+# Single extractor pass: writes cli.original.js to $ClawDir and creates
+# vendor\<name>\<arch>-<os>\<name>.node for every napi module in one go.
 $VendorDir = Join-Path $ClawDir "vendor"
 if (Test-Path $VendorDir) { Remove-Item -Recurse -Force $VendorDir }
-New-Item -ItemType Directory -Force -Path $VendorDir | Out-Null
 
 $dstCli = Join-Path $ClawDir "cli.original.js"
+if (Test-Path $dstCli) { Remove-Item -Force $dstCli }
 
-Write-Dim "Extracting cli.js from $NativeBinLabel ..."
-& node $extractorPath $NativeBin $ClawDir --cli-js 2>&1 | ForEach-Object { Write-Host "  $_" }
+Write-Dim "Extracting cli.js + napi modules from $NativeBinLabel ..."
+& node $extractorPath $NativeBin $ClawDir 2>&1 | ForEach-Object { Write-Host "  $_" }
 if (-not (Test-Path $dstCli)) {
     Write-Err "Failed to extract cli.js from native binary"
     exit 1
 }
-
-Write-Dim "Extracting native modules from $NativeBinLabel ..."
-& node $extractorPath $NativeBin $VendorDir 2>&1 | ForEach-Object { Write-Host "  $_" }
 
 # Note: keep extractorPath around — repatch.mjs uses it on version drift
 
@@ -838,17 +779,25 @@ const dst = `${here}/cli.original.cjs`;
 
 let code = readFileSync(src, 'utf8');
 
+// (0) Strip leading @bun pragma comments (e.g. "// @bun @bytecode @bun-cjs\n")
+// Bun requires the file to start directly with "(function" to recognize
+// the CommonJS wrapper; any preceding comment breaks that detection.
+code = code.replace(/^(?:\/\/[^\n]*\n)+/, '');
+
+// (1) bunfs .node module paths → runtime vendor lookup
 code = code.replace(
   /require\(['"](\/\$bunfs\/root\/([\w-]+)\.node)['"]\)/g,
   (m, _full, name) =>
     `require(require('path').join(__dirname,'vendor',${JSON.stringify(name)},\`\${process.arch==='arm64'?'arm64':'x64'}-\${process.platform==='darwin'?'darwin':process.platform==='linux'?'linux':'win32'}\`,${JSON.stringify(name + '.node')}))`,
 );
 
+// (2) build-time fileURLToPath() leaks → use cli.cjs's own __filename
 code = code.replace(
   /[\w$]+\.fileURLToPath\("file:\/\/\/home\/runner\/work\/claude-cli-internal\/claude-cli-internal\/[^"]*"\)/g,
   () => '__filename',
 );
 
+// (3) make the outer (function(...){...}) actually run
 code = code.replace(/\}\)\s*$/, '})(exports, require, module, __filename, __dirname)');
 
 writeFileSync(dst, code);
@@ -889,9 +838,8 @@ if (!nativeBin || !existsSync(nativeBin)) {
   process.exit(1);
 }
 
-const vendor = join(here, 'vendor');
-rmSync(vendor, { recursive: true, force: true });
-mkdirSync(vendor, { recursive: true });
+rmSync(join(here, 'vendor'), { recursive: true, force: true });
+rmSync(join(here, 'cli.original.js'), { force: true });
 
 const runtime = process.execPath;
 
@@ -907,8 +855,7 @@ const extractor = join(here, 'extract-natives.mjs');
 const postProc = join(here, 'post-process.mjs');
 const patcher = join(here, 'patch.mjs');
 
-run('extract cli.js', [extractor, nativeBin, here, '--cli-js']);
-run('extract natives', [extractor, nativeBin, vendor]);
+run('extract', [extractor, nativeBin, here]);
 run('post-process', [postProc]);
 run('patcher', [patcher]);
 
